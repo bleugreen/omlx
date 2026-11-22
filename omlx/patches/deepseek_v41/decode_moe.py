@@ -391,6 +391,36 @@ inline void aff8_rows(W w, S s, B b, uint row0, X x, uint lane, thread float* ac
     }
     for (int r = 0; r < ROWS; ++r) acc[r] = simd_sum(acc[r]);
 }
+// aff8_rows of two matrices against one vector (the routed experts' w1 and w3), reading and
+// pre-scaling x once for both: each row's arithmetic and lane order are aff8_rows', so ga / gb
+// equal two aff8_rows calls bit for bit.
+template <int K, int ROWS, int BITS, int GS, typename W, typename S, typename B, typename X>
+inline void aff8_rows2(W wa, S sa, B ba, W wb, S sb, B bb, uint row0, X x, uint lane, thread float* ga, thread float* gb) {
+    constexpr int N = aff_lane_codes<BITS>();
+    static_assert(K % GS == 0 && GS % N == 0, "K must be a multiple of whole lane steps");
+    for (int r = 0; r < ROWS; ++r) { ga[r] = 0.0f; gb[r] = 0.0f; }
+    for (uint k = lane * N; k < uint(K); k += 32 * N) {
+        float xv[N], xs = 0.0f;
+        for (int i = 0; i < N; ++i) { xv[i] = float(x[k + i]); xs += xv[i]; }
+        for (int i = 0; i < N; ++i) xv[i] *= aff_unit<BITS>(i);
+        for (int m = 0; m < 2; ++m) {
+            const W w = m ? wb : wa;
+            const S s = m ? sb : sa;
+            const B b = m ? bb : ba;
+            thread float* acc = m ? gb : ga;
+            for (int r = 0; r < ROWS; ++r) {
+                const auto wr = reinterpret_cast<const device uchar*>(w + size_t(row0 + r) * (K * BITS / 32)) + k * BITS / 8;
+                float q[N];
+                affine_codes_lane<BITS>(wr, q);
+                float a = 0.0f;
+                for (int j = 0; j < N; ++j) a = fma(q[j], xv[j], a);
+                const size_t g = size_t(row0 + r) * (K / GS) + k / GS;
+                acc[r] = fma(float(s[g]), a, fma(float(b[g]), xs, acc[r]));
+            }
+        }
+    }
+    for (int r = 0; r < ROWS; ++r) { ga[r] = simd_sum(ga[r]); gb[r] = simd_sum(gb[r]); }
+}
 // aff8_rows for NB vectors sharing each weight decode; per vector the arithmetic is aff8_rows'.
 template <int K, int ROWS, int NB, int BITS, int GS, typename W, typename S, typename B, typename X>
 inline void aff8_rows_nb(W w, S s, B b, uint row0, X x, uint XS, uint lane, thread float* acc) {
@@ -698,8 +728,7 @@ _UP = r"""
     const uint row0 = threadgroup_position_in_grid.x * 32 + sg * 4;
     if (slot < uint(TOPK)) {
         const uint e = uint(chosen[slot]);
-        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, R1_X, lane, g4);
-        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X, lane, u4);
+        R13_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X, lane, g4, u4);
     } else {
         S1_ROWS(DIM, 4, sw1, ss1, sb1, row0, xq, lane, g4);
         S3_ROWS(DIM, 4, sw3, ss3, sb3, row0, xq, lane, u4);
@@ -778,8 +807,7 @@ _UP_NB = r"""
             }
         const uint e = uint(chosen[slot]);
         float g4[4], u4[4];
-        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, R1_X + b * DIM, lane, g4);
-        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X + b * DIM, lane, u4);
+        R13_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X + b * DIM, lane, g4, u4);
         if (lane < 4) {
             float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
@@ -837,8 +865,7 @@ _UP_NB_MMA = r"""
             }
         const uint e = uint(chosen[slot]);
         float g4[4], u4[4];
-        R1_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), row0, R1_X + b * DIM, lane, g4);
-        R3_ROWS(DIM, 4, w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X + b * DIM, lane, u4);
+        R13_ROWS(DIM, 4, w1 + size_t(e) * INTER * R1_WPR(DIM), s1p + size_t(e) * INTER * R1_SPR(DIM), b1p + size_t(e) * INTER * R1_SPR(DIM), w3 + size_t(e) * INTER * R3_WPR(DIM), s3p + size_t(e) * INTER * R3_SPR(DIM), b3p + size_t(e) * INTER * R3_SPR(DIM), row0, R1_X + b * DIM, lane, g4, u4);
         if (lane < 4) {
             float gate = float(bfloat16_t(g4[lane])), up = float(bfloat16_t(u4[lane]));
             if (limit[0] > 0.0f) { up = clamp(up, -limit[0], limit[0]); gate = min(gate, limit[0]); }
@@ -1012,6 +1039,15 @@ def format_macros(roles):
             f"#define {role}_MMA16(K_, KS_, NB_, w_, s_, b_, r0_, x_, xs_, l_, ks_, red_, t0_, t1_) {mma16}",
             f"#define {role}_OQH {int(mode == 'oqh')}",
         ]
+    # w1 and w3 of a routed expert in one pass over x when they share an aff8 layout.
+    fmt = dict(roles)
+    r1, r3 = fmt.get("R1"), fmt.get("R3")
+    if r1 is not None and r1 == r3 and r1[0] == "affine" and r1[1] in (2, 4, 6, 8):
+        lines.append(f"#define R13_ROWS(K_, R_, w1_, s1_, b1_, w3_, s3_, b3_, r0_, x_, l_, g_, u_) "
+                     f"aff8_rows2<K_, R_, {r1[1]}, {r1[2]}>(w1_, s1_, b1_, w3_, s3_, b3_, r0_, x_, l_, g_, u_)")
+    else:
+        lines.append("#define R13_ROWS(K_, R_, w1_, s1_, b1_, w3_, s3_, b3_, r0_, x_, l_, g_, u_) "
+                     "{ R1_ROWS(K_, R_, w1_, s1_, b1_, r0_, x_, l_, g_); R3_ROWS(K_, R_, w3_, s3_, b3_, r0_, x_, l_, u_); }")
     # oQh routed experts read their inputs rotated: xr for w1 / w3, hr for w2.
     oqh = {role: mode == "oqh" for role, (mode, _, _) in roles}
     lines += [
